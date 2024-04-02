@@ -111,6 +111,7 @@ use bitcoin::secp256k1::schnorr::Signature;
 use bitcoin::address::{Address, Payload, WitnessProgram, WitnessVersion};
 use bitcoin::key::TweakedPublicKey;
 use core::convert::{AsRef, TryFrom};
+use core::str::FromStr;
 use core::time::Duration;
 use crate::io;
 use crate::blinded_path::BlindedPath;
@@ -133,6 +134,8 @@ use crate::prelude::*;
 
 #[cfg(feature = "std")]
 use std::time::SystemTime;
+
+use super::parse::Bech32Encode;
 
 pub(crate) const DEFAULT_RELATIVE_EXPIRY: Duration = Duration::from_secs(7200);
 
@@ -620,6 +623,30 @@ pub struct Bolt12Invoice {
 	contents: InvoiceContents,
 	signature: Signature,
 	tagged_hash: TaggedHash,
+}
+
+impl Bech32Encode for Bolt12Invoice {
+	const BECH32_HRP: &'static str = "lni";
+}
+
+impl FromStr for Bolt12Invoice {
+	type Err = Bolt12ParseError;
+
+	fn from_str(s: &str) -> Result<Self, <Self as FromStr>::Err> {
+		Self::from_bech32_str(s)
+	}
+}
+
+impl AsRef<[u8]> for Bolt12Invoice {
+	fn as_ref(&self) -> &[u8] {
+		&self.bytes
+	}
+}
+
+impl core::fmt::Display for Bolt12Invoice {
+	fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+		self.fmt_bech32_str(f)
+	}
 }
 
 /// The contents of an [`Bolt12Invoice`] for responding to either an [`Offer`] or a [`Refund`].

@@ -220,7 +220,7 @@ impl From<secp256k1::Error> for Bolt12ParseError {
 #[cfg(test)]
 mod bolt12_tests {
 	use super::Bolt12ParseError;
-	use crate::offers::offer::Offer;
+	use crate::offers::{invoice::Bolt12Invoice, offer::Offer};
 
 	#[test]
 	fn encodes_offer_as_bech32_without_checksum() {
@@ -229,6 +229,15 @@ mod bolt12_tests {
 		let reencoded_offer = offer.to_string();
 		dbg!(reencoded_offer.parse::<Offer>().unwrap());
 		assert_eq!(reencoded_offer, encoded_offer);
+	}
+
+	#[test]
+	fn decodes_invoice() {
+		let encoded_invoice = "lni1qqgfh4yhzqn883pldda005fyyadv2q3qqc3xu3s3rg94nj40zfsy866mhu5vxne6tcej5878k2mneuvgjy8ssqc0gfqq5rtd0ys8getnwssx7enxv4epvggrnmyaz72z6pmgxunkc22jzpem9jyr7dxzhxrh35sz0ctqpx4t7u34qgqxyfhyvyg6pdvu4tcjvpp7kkal9rp57wj7xv4pl3ajku70rzy3pavzzqm27z45lxsc24uk0g5r67px00aw7v2swqhfwd5exgt7jydadqrgu2sfsqu7e8ghjsksw6phyakzj5sswwev3qlnfs4esaudyqn7zcqf42lhyvp6rxrp722syuye56adgdcudgeyq8qcxaeg0wafqtj5v3sfs4ywm9cpqvtcpfnjx6ftalnmaxnvrhq8kus4zja2zt2k5fppqd7hunftu4kp5qpj9x4cr5e9gg750eq02fmgmdks8lq78mfm4d307qpzc6pymuvvdxmv04v66zte0u9m25kws5m36lcmfg4r5gwqqqqqqqqqqqqqqq9qqqqqqqqqqqqqr5jt9hav2gqqqqqq5szxvzeptk5zp3v7j73xka69e9fzpcf5x6j33flxc4e9d3pfvevsx77d5xf46cz44gps7sjqkqss88kf69u595rksde8ds54yyrnktyg8u6v9wv80rfqylskqzd2haer7pq8kz40m2dpc2whv34m7e54udy588zj0xmgpuf9d0a2uhfat69jnmdcmf2lzur2qf84aukxg0m58hw4e6v3m50ettf3qk2yv5uu440kys";
+		let invoice = dbg!(encoded_invoice.parse::<Bolt12Invoice>().unwrap());
+		let reencoded_invoice = invoice.to_string();
+		dbg!(reencoded_invoice.parse::<Bolt12Invoice>().unwrap());
+		assert_eq!(reencoded_invoice, encoded_invoice);
 	}
 
 	#[test]
