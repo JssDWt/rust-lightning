@@ -4294,6 +4294,15 @@ impl<
 						is_probe,
 					})
 				},
+				PendingOutboundPayment::AwaitingSelfClaim { payment_hash, amount_msat, .. } => {
+					Some(RecentPaymentDetails::Pending {
+						payment_id: *payment_id,
+						payment_hash: *payment_hash,
+						total_msat: *amount_msat,
+						pending_fee_msat: None,
+						is_probe: false,
+					})
+				},
 				PendingOutboundPayment::Abandoned { payment_hash, .. } => {
 					let is_probe = outbound_payment::payment_is_probe(payment_hash, payment_id, self.probing_cookie_secret);
 					Some(RecentPaymentDetails::Abandoned {
@@ -10022,6 +10031,43 @@ impl<
 		let payment_hash: PaymentHash = payment_preimage.into();
 
 		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+
+		// A self-payment has no HTLC to claim: resolve the tracked outbound (marking it `Fulfilled`,
+		// so it stays in `list_recent_payments`) and surface the `PaymentSent`/`PaymentClaimed` pair
+		// directly.
+		if let Some((payment_id, payment_secret, amount_msat)) =
+			self.pending_outbound_payments.fulfill_self_payment(payment_hash)
+		{
+			let mut pending_events = self.pending_events.lock().unwrap();
+			pending_events.push_back((
+				events::Event::PaymentSent {
+					payment_id: Some(payment_id),
+					payment_preimage,
+					payment_hash,
+					amount_msat: Some(amount_msat),
+					fee_paid_msat: Some(0),
+					bolt12_invoice: None,
+				},
+				None,
+			));
+			pending_events.push_back((
+				events::Event::PaymentClaimed {
+					receiver_node_id: Some(self.get_our_node_id()),
+					payment_hash,
+					amount_msat,
+					purpose: events::PaymentPurpose::Bolt11InvoicePayment {
+						payment_preimage: Some(payment_preimage),
+						payment_secret,
+					},
+					htlcs: Vec::new(),
+					sender_intended_total_msat: None,
+					onion_fields: None,
+					payment_id: Some(payment_id),
+				},
+				None,
+			));
+			return;
+		}
 
 		let (sources, claiming_payment) = {
 			let res = self.claimable_payments.lock().unwrap().begin_claiming_payment(

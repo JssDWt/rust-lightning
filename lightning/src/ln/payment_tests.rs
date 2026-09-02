@@ -43,7 +43,9 @@ use crate::routing::router::{
 };
 use crate::routing::scoring::ChannelUsage;
 use crate::sign::EntropySource;
-use crate::types::features::{Bolt11InvoiceFeatures, ChannelTypeFeatures};
+use crate::types::features::{
+	Bolt11InvoiceFeatures, ChannelFeatures, ChannelTypeFeatures, NodeFeatures,
+};
 use crate::types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::types::string::UntrustedString;
 use crate::util::config::{HTLCInterceptionFlags, UserConfig};
@@ -67,7 +69,9 @@ use std::thread;
 
 #[cfg(feature = "std")]
 use {
+	crate::sign::{NodeSigner, Recipient},
 	crate::util::time::Instant as TestTime,
+	lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder},
 	std::time::{Duration, Instant, SystemTime},
 };
 
@@ -6161,4 +6165,579 @@ fn bolt11_multi_node_mpp_with_retry() {
 	} else {
 		panic!("{payment_sent_b:?}");
 	}
+}
+
+/// Asserts that `events` is exactly the `PaymentSent` + `PaymentClaimed` pair a claimed
+/// self-payment produces, with the expected fields.
+fn assert_self_payment_claim_events(
+	events: Vec<Event>, payment_preimage: PaymentPreimage, payment_hash: PaymentHash,
+	payment_secret: PaymentSecret, amount_msat: u64,
+) {
+	assert_eq!(events.len(), 2);
+	let mut saw_sent = false;
+	let mut saw_claimed = false;
+	for event in events {
+		match event {
+			Event::PaymentSent {
+				payment_id,
+				payment_preimage: sent_preimage,
+				payment_hash: sent_hash,
+				amount_msat: sent_amount,
+				fee_paid_msat,
+				..
+			} => {
+				assert_eq!(payment_id, Some(PaymentId(payment_hash.0)));
+				assert_eq!(sent_preimage, payment_preimage);
+				assert_eq!(sent_hash, payment_hash);
+				assert_eq!(sent_amount, Some(amount_msat));
+				assert_eq!(fee_paid_msat, Some(0));
+				saw_sent = true;
+			},
+			Event::PaymentClaimed {
+				payment_hash: claimed_hash,
+				amount_msat: claimed_amount,
+				purpose,
+				htlcs,
+				..
+			} => {
+				assert_eq!(claimed_hash, payment_hash);
+				assert_eq!(claimed_amount, amount_msat);
+				match purpose {
+					PaymentPurpose::Bolt11InvoicePayment {
+						payment_preimage: claimed_preimage,
+						payment_secret: claimed_secret,
+					} => {
+						assert_eq!(claimed_preimage, Some(payment_preimage));
+						assert_eq!(claimed_secret, payment_secret);
+					},
+					_ => panic!("Unexpected payment purpose"),
+				}
+				assert!(htlcs.is_empty());
+				saw_claimed = true;
+			},
+			_ => panic!("Unexpected event"),
+		}
+	}
+	assert!(saw_sent, "expected a PaymentSent event");
+	assert!(saw_claimed, "expected a PaymentClaimed event");
+}
+
+/// Claims a self-payment (surfaced by paying our own node) and asserts it resolves into exactly a
+/// `PaymentSent` + `PaymentClaimed` pair with the expected fields, is kept as `Fulfilled` in
+/// `list_recent_payments`, and that a second claim of the same preimage is a silent no-op.
+fn check_self_payment_claimed<'a, 'b, 'c>(
+	node: &Node<'a, 'b, 'c>, payment_preimage: PaymentPreimage, payment_hash: PaymentHash,
+	payment_secret: PaymentSecret, amount_msat: u64,
+) {
+	node.node.claim_funds(payment_preimage);
+	assert_self_payment_claim_events(
+		node.node.get_and_clear_pending_events(),
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+
+	// The fulfilled self-payment is kept (like any completed payment) so it stays in
+	// `list_recent_payments` as `Fulfilled` until stale cleanup, rather than being removed.
+	match node.node.list_recent_payments().as_slice() {
+		[RecentPaymentDetails::Fulfilled { payment_id, payment_hash: kept_hash, .. }] => {
+			assert_eq!(*payment_id, PaymentId(payment_hash.0));
+			assert_eq!(*kept_hash, Some(payment_hash));
+		},
+		other => panic!("expected a single fulfilled self-payment, got {other:?}"),
+	}
+
+	// Claiming again is a no-op: the entry is already `Fulfilled`, so no duplicate events fire.
+	node.node.claim_funds(payment_preimage);
+	assert!(node.node.get_and_clear_pending_events().is_empty());
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn self_payment() {
+	// A node can pay a BOLT11 invoice it issued to itself. There is no HTLC to route: paying
+	// surfaces `PaymentClaimable` immediately with no preimage (as for a hold invoice) and
+	// registers a tracked outbound payment. Providing the preimage via `claim_funds` then resolves
+	// the outbound (`PaymentSent`) and the receive (`PaymentClaimed`).
+	let chanmon_cfgs = create_chanmon_cfgs(1);
+	let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(1, &node_cfgs, &[None]);
+	let nodes = create_network(1, &node_cfgs, &node_chanmgrs);
+
+	let amount_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(amount_msat), None);
+
+	let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+	let raw_invoice = InvoiceBuilder::new(Currency::Bitcoin)
+		.description("self-payment".into())
+		.payment_hash(payment_hash)
+		.payment_secret(payment_secret)
+		.duration_since_epoch(timestamp)
+		.min_final_cltv_expiry_delta(144)
+		.amount_milli_satoshis(amount_msat)
+		.build_raw()
+		.unwrap();
+	let sig = nodes[0].keys_manager.backing.sign_invoice(&raw_invoice, Recipient::Node).unwrap();
+	let invoice = raw_invoice.sign::<_, ()>(|_| Ok(sig)).unwrap();
+	let invoice = Bolt11Invoice::from_signed(invoice).unwrap();
+
+	nodes[0]
+		.node
+		.pay_for_bolt11_invoice(
+			&invoice,
+			PaymentId(payment_hash.0),
+			None,
+			OptionalBolt11PaymentParams::default(),
+		)
+		.unwrap();
+
+	// Paying our own invoice surfaces a single `PaymentClaimable` with no preimage yet.
+	let mut events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events.pop().unwrap() {
+		Event::PaymentClaimable {
+			payment_hash: claimable_hash,
+			amount_msat: claimable_amt,
+			purpose,
+			..
+		} => {
+			assert_eq!(claimable_hash, payment_hash);
+			assert_eq!(claimable_amt, amount_msat);
+			match purpose {
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => {
+					assert!(payment_preimage.is_none());
+				},
+				_ => panic!("Unexpected payment purpose"),
+			}
+		},
+		_ => panic!("Unexpected event"),
+	}
+
+	// The outbound is tracked as pending until we claim.
+	let recent = nodes[0].node.list_recent_payments();
+	assert_eq!(recent.len(), 1);
+	assert!(matches!(
+		recent[0],
+		RecentPaymentDetails::Pending { payment_hash: pending_hash, .. } if pending_hash == payment_hash
+	));
+
+	// Providing the preimage resolves both the outbound (`PaymentSent`) and the receive
+	// (`PaymentClaimed`); the payment is then kept as `Fulfilled` and a repeat claim is a no-op.
+	check_self_payment_claimed(
+		&nodes[0],
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+}
+
+#[test]
+fn self_payment_via_send_payment() {
+	// `send_payment` to our own node id takes the same self-payment loopback as
+	// `pay_for_bolt11_invoice`: no HTLC is routed, a `PaymentClaimable` is surfaced with no
+	// preimage, and `claim_funds` then resolves the outbound (`PaymentSent`) and the receive
+	// (`PaymentClaimed`). This drives the path without an invoice, so it needs no `std`.
+	let chanmon_cfgs = create_chanmon_cfgs(1);
+	let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(1, &node_cfgs, &[None]);
+	let nodes = create_network(1, &node_cfgs, &node_chanmgrs);
+
+	let amount_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(amount_msat), None);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(nodes[0].node.get_our_node_id(), TEST_FINAL_CLTV),
+		amount_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+
+	// Paying ourselves surfaces a single `PaymentClaimable` with no preimage yet, and tracks the
+	// outbound as pending.
+	let mut events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events.pop().unwrap() {
+		Event::PaymentClaimable {
+			payment_hash: claimable_hash,
+			amount_msat: claimable_amt,
+			purpose,
+			..
+		} => {
+			assert_eq!(claimable_hash, payment_hash);
+			assert_eq!(claimable_amt, amount_msat);
+			match purpose {
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => {
+					assert!(payment_preimage.is_none());
+				},
+				_ => panic!("Unexpected payment purpose"),
+			}
+		},
+		_ => panic!("Unexpected event"),
+	}
+	assert!(matches!(
+		nodes[0].node.list_recent_payments().as_slice(),
+		[RecentPaymentDetails::Pending { payment_hash: pending_hash, .. }] if *pending_hash == payment_hash
+	));
+
+	// Providing the preimage resolves both the outbound (`PaymentSent`) and the receive
+	// (`PaymentClaimed`); the payment is then kept as `Fulfilled` and a repeat claim is a no-op.
+	check_self_payment_claimed(
+		&nodes[0],
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+}
+
+#[test]
+fn self_payment_persists_across_restart() {
+	// An unclaimed self-payment is a tracked `AwaitingSelfClaim` outbound payment, so it must
+	// survive a serialize/reload that happens after the `PaymentClaimable` but before the claim.
+	// Two nodes with a single `nodes[0] -> nodes[1]` channel give `reload_node!` a monitor to
+	// serialize; that channel is a dead end for routing back to `nodes[0]`, so the payment still
+	// shortcuts rather than being sent as an HTLC. Uses `send_payment` (no invoice), so it needs no
+	// `std`; `reload_node!` itself does not require `std` either.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let persister;
+	let new_chain_monitor;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes_0_deserialized;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let amount_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(amount_msat), None);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(node_a_id, TEST_FINAL_CLTV),
+		amount_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+
+	// We are now after the send but before the claim: a single `PaymentClaimable` fired (no
+	// preimage yet), and the outbound is tracked as pending.
+	let mut events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events.pop().unwrap() {
+		Event::PaymentClaimable {
+			payment_hash: claimable_hash,
+			amount_msat: claimable_amt,
+			purpose,
+			..
+		} => {
+			assert_eq!(claimable_hash, payment_hash);
+			assert_eq!(claimable_amt, amount_msat);
+			match purpose {
+				PaymentPurpose::Bolt11InvoicePayment { payment_preimage, .. } => {
+					assert!(payment_preimage.is_none());
+				},
+				_ => panic!("Unexpected payment purpose"),
+			}
+		},
+		_ => panic!("Unexpected event"),
+	}
+	assert!(matches!(
+		nodes[0].node.list_recent_payments().as_slice(),
+		[RecentPaymentDetails::Pending { payment_hash: pending_hash, .. }] if *pending_hash == payment_hash
+	));
+
+	// Serialize and reload `nodes[0]`. The idle channel is in sync with its monitor, so the reload
+	// is a clean restart; the point is that the `AwaitingSelfClaim` survives serialization.
+	nodes[1].node.peer_disconnected(node_a_id);
+	let chan_0_monitor_serialized = get_monitor!(nodes[0], chan_id).encode();
+	reload_node!(
+		nodes[0],
+		nodes[0].node.encode(),
+		&[&chan_0_monitor_serialized],
+		persister,
+		new_chain_monitor,
+		nodes_0_deserialized
+	);
+
+	// The restart surfaces no events, and the self-payment is still tracked as pending.
+	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+	assert!(matches!(
+		nodes[0].node.list_recent_payments().as_slice(),
+		[RecentPaymentDetails::Pending { payment_hash: pending_hash, .. }] if *pending_hash == payment_hash
+	));
+
+	// Claiming on the reloaded node still resolves the payment into `PaymentSent` + `PaymentClaimed`
+	// and keeps it as `Fulfilled`.
+	check_self_payment_claimed(
+		&nodes[0],
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+}
+
+#[test]
+fn self_payment_not_abandoned_while_unclaimed() {
+	// A self-payment sits as `AwaitingSelfClaim` until the preimage is provided. Maintenance ticks
+	// and forward-processing must not abandon it: with no HTLCs in-flight, its `is_pre_htlc_lock_in`
+	// exclusion keeps it alive (rather than treating zero pending parts as retry-exhaustion), so it
+	// stays claimable indefinitely.
+	let chanmon_cfgs = create_chanmon_cfgs(1);
+	let node_cfgs = create_node_cfgs(1, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(1, &node_cfgs, &[None]);
+	let nodes = create_network(1, &node_cfgs, &node_chanmgrs);
+
+	let amount_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(amount_msat), None);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(nodes[0].node.get_our_node_id(), TEST_FINAL_CLTV),
+		amount_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+
+	let mut events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match events.pop().unwrap() {
+		Event::PaymentClaimable { payment_hash: claimable_hash, .. } => {
+			assert_eq!(claimable_hash, payment_hash);
+		},
+		_ => panic!("Unexpected event"),
+	}
+
+	// Run the payment-maintenance paths many times over. `timer_tick_occurred` drives
+	// `remove_stale_payments` and `process_pending_htlc_forwards` drives the retry/abandon check;
+	// neither may abandon the unclaimed self-payment.
+	for _ in 0..10 {
+		nodes[0].node.timer_tick_occurred();
+	}
+	nodes[0].node.process_pending_htlc_forwards();
+
+	assert!(
+		nodes[0].node.get_and_clear_pending_events().is_empty(),
+		"maintenance must not abandon an unclaimed self-payment"
+	);
+	assert!(matches!(
+		nodes[0].node.list_recent_payments().as_slice(),
+		[RecentPaymentDetails::Pending { payment_hash: pending_hash, .. }] if *pending_hash == payment_hash
+	));
+
+	// The preimage still resolves the payment after all those ticks.
+	check_self_payment_claimed(
+		&nodes[0],
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+}
+
+#[test]
+fn self_payment_via_provided_route_is_not_shortcut() {
+	// A payment whose payee is us but for which a real route loops back to us (a rebalancing loop)
+	// is sent as a normal HTLC, not shortcut: the shortcut only triggers when the router finds *no*
+	// route to ourselves. Providing the route explicitly (via `send_payment_with_route`) bypasses
+	// `find_route`, so the payee being us must not turn it into an immediate self-claim. Modeled on
+	// the rebalance-loop payment in `functional_tests::fake_network_test`, using the smallest
+	// topology that routes back to the sender: a `nodes[0] -> nodes[1] -> nodes[2] -> nodes[0]`
+	// triangle.
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let node_c_id = nodes[2].node.get_our_node_id();
+
+	let chan_0_1 = create_announced_chan_between_nodes(&nodes, 0, 1);
+	let chan_1_2 = create_announced_chan_between_nodes(&nodes, 1, 2);
+	let chan_2_0 = create_announced_chan_between_nodes(&nodes, 2, 0);
+
+	let recv_value = 1_000_000;
+
+	// A manually-built route that loops back to the sender: nodes[0] -> nodes[1] -> nodes[2] ->
+	// nodes[0]. Each hop's fee/cltv comes from the policy of the channel that hop forwards into.
+	let mut hops = vec![
+		RouteHop {
+			pubkey: node_b_id,
+			node_features: NodeFeatures::empty(),
+			short_channel_id: chan_0_1.0.contents.short_channel_id,
+			channel_features: ChannelFeatures::empty(),
+			fee_msat: 0,
+			cltv_expiry_delta: chan_1_2.0.contents.cltv_expiry_delta as u32,
+			maybe_announced_channel: true,
+		},
+		RouteHop {
+			pubkey: node_c_id,
+			node_features: NodeFeatures::empty(),
+			short_channel_id: chan_1_2.0.contents.short_channel_id,
+			channel_features: ChannelFeatures::empty(),
+			fee_msat: 0,
+			cltv_expiry_delta: chan_2_0.0.contents.cltv_expiry_delta as u32,
+			maybe_announced_channel: true,
+		},
+		RouteHop {
+			pubkey: node_a_id,
+			node_features: nodes[0].node.node_features(),
+			short_channel_id: chan_2_0.0.contents.short_channel_id,
+			channel_features: nodes[0].node.channel_features(),
+			fee_msat: recv_value,
+			cltv_expiry_delta: TEST_FINAL_CLTV,
+			maybe_announced_channel: true,
+		},
+	];
+	hops[1].fee_msat = chan_2_0.0.contents.fee_base_msat as u64
+		+ chan_2_0.0.contents.fee_proportional_millionths as u64 * hops[2].fee_msat / 1_000_000;
+	hops[0].fee_msat = chan_1_2.0.contents.fee_base_msat as u64
+		+ chan_1_2.0.contents.fee_proportional_millionths as u64 * hops[1].fee_msat / 1_000_000;
+
+	let payment_params = PaymentParameters::from_node_id(node_a_id, TEST_FINAL_CLTV)
+		.with_bolt11_features(nodes[0].node.bolt11_invoice_features())
+		.unwrap();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, recv_value);
+	let route = Route { paths: vec![Path { hops, blinded_tail: None }], route_params };
+
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(recv_value), None);
+
+	// Send via the provided route (not `find_route`), so the payee being us does not shortcut.
+	nodes[0]
+		.node
+		.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, recv_value),
+			PaymentId(payment_hash.0),
+		)
+		.unwrap();
+
+	// Not shortcut: a real HTLC was locked into the first channel (one monitor update), there is no
+	// immediate `PaymentClaimable`, and the outbound is tracked as a real in-flight HTLC. A shortcut
+	// would instead surface `PaymentClaimable` right away and track the payment with no fee
+	// (`pending_fee_msat` `None`).
+	check_added_monitors(&nodes[0], 1);
+	assert!(nodes[0].node.get_and_clear_pending_events().is_empty());
+	match nodes[0].node.list_recent_payments().as_slice() {
+		[RecentPaymentDetails::Pending {
+			payment_hash: pending_hash,
+			pending_fee_msat: Some(_),
+			..
+		}] => {
+			assert_eq!(*pending_hash, payment_hash);
+		},
+		other => panic!("expected a single pending HTLC self-payment, got {other:?}"),
+	}
+
+	// The HTLC traverses the loop and arrives back at us, surfacing `PaymentClaimable` only now.
+	let path: &[_] = &[&nodes[1], &nodes[2], &nodes[0]];
+	pass_along_route(&nodes[0], &[path], recv_value, payment_hash, payment_secret);
+
+	// It is then claimed via the normal HTLC flow, generating `PaymentSent` + `PaymentClaimed`.
+	claim_payment(&nodes[0], path, payment_preimage);
+}
+
+#[test]
+fn self_payment_claim_persists_across_restart() {
+	// Claiming a self-payment marks the outbound `Fulfilled` and queues `PaymentSent` +
+	// `PaymentClaimed`, all in the `ChannelManager` (a self-payment has no `ChannelMonitor`). A
+	// restart after the claim but before the events are handled must replay both events and keep
+	// the payment `Fulfilled`: the fulfillment (send side) and the claim events (receive side) are
+	// persisted together, atomically. As in `self_payment_persists_across_restart`, the single
+	// `nodes[0] -> nodes[1]` channel only gives `reload_node!` a monitor to serialize and is a dead
+	// end for routing back to `nodes[0]`, so the payment still shortcuts.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let persister;
+	let new_chain_monitor;
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes_0_deserialized;
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+
+	let amount_msat = 100_000;
+	let (payment_preimage, payment_hash, payment_secret) =
+		get_payment_preimage_hash(&nodes[0], Some(amount_msat), None);
+
+	let route_params = RouteParameters::from_payment_params_and_value(
+		PaymentParameters::from_node_id(node_a_id, TEST_FINAL_CLTV),
+		amount_msat,
+	);
+	nodes[0]
+		.node
+		.send_payment(
+			payment_hash,
+			RecipientOnionFields::secret_only(payment_secret, amount_msat),
+			PaymentId(payment_hash.0),
+			route_params,
+			Retry::Attempts(0),
+		)
+		.unwrap();
+
+	// Handle the `PaymentClaimable` so only the claim's events remain to be tested.
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], Event::PaymentClaimable { .. }));
+
+	// Claim, but do NOT process the resulting events: they must survive the restart.
+	nodes[0].node.claim_funds(payment_preimage);
+
+	nodes[1].node.peer_disconnected(node_a_id);
+	let chan_0_monitor_serialized = get_monitor!(nodes[0], chan_id).encode();
+	reload_node!(
+		nodes[0],
+		nodes[0].node.encode(),
+		&[&chan_0_monitor_serialized],
+		persister,
+		new_chain_monitor,
+		nodes_0_deserialized
+	);
+
+	// The reloaded node replays exactly `PaymentSent` + `PaymentClaimed`, and the payment is kept
+	// `Fulfilled` — the fulfillment and its claim events were persisted atomically.
+	assert_self_payment_claim_events(
+		nodes[0].node.get_and_clear_pending_events(),
+		payment_preimage,
+		payment_hash,
+		payment_secret,
+		amount_msat,
+	);
+	assert!(matches!(
+		nodes[0].node.list_recent_payments().as_slice(),
+		[RecentPaymentDetails::Fulfilled { payment_hash: kept_hash, .. }] if *kept_hash == Some(payment_hash)
+	));
 }

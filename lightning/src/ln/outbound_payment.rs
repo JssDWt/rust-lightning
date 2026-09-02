@@ -29,7 +29,7 @@ use crate::offers::invoice_request::InvoiceRequest;
 use crate::offers::nonce::Nonce;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::router::{
-	BlindedTail, InFlightHtlcs, Path, PaymentParameters, Route, RouteParameters,
+	BlindedTail, InFlightHtlcs, Path, Payee, PaymentParameters, Route, RouteParameters,
 	RouteParametersConfig, Router,
 };
 use crate::sign::{EntropySource, NodeSigner, Recipient};
@@ -170,6 +170,15 @@ pub(crate) enum PendingOutboundPayment {
 		/// the payment was abandoned. Added in 0.3.
 		pending_fee_msat: Option<u64>,
 	},
+	/// A payment to ourselves for which the router found no route, so we shortcut it rather than
+	/// sending an HTLC. `PaymentClaimable` is surfaced when this is created; providing the preimage
+	/// via `ChannelManager::claim_funds` resolves it into `PaymentSent` + `PaymentClaimed`. Held in
+	/// the outbound set so it is persisted and appears in `list_recent_payments`.
+	AwaitingSelfClaim {
+		payment_hash: PaymentHash,
+		payment_secret: PaymentSecret,
+		amount_msat: u64,
+	},
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -255,13 +264,15 @@ impl PendingOutboundPayment {
 			params.insert_previously_failed_blinded_path(blinded_tail);
 		}
 	}
-	// Used for payments to BOLT 12 offers where we are either waiting for an invoice or have an
-	// invoice but have not locked in HTLCs for the payment yet.
+	// Whether the payment holds no HTLCs locked into channels, so having no pending HTLC parts must
+	// not be treated as retry-exhaustion (which would auto-abandon it). Covers BOLT 12 offers that
+	// are still waiting for or have just received an invoice, and self-payments awaiting a claim.
 	fn is_pre_htlc_lock_in(&self) -> bool {
 		match self {
 			PendingOutboundPayment::AwaitingInvoice { .. }
 			| PendingOutboundPayment::InvoiceReceived { .. }
-			| PendingOutboundPayment::StaticInvoiceReceived { .. } => true,
+			| PendingOutboundPayment::StaticInvoiceReceived { .. }
+			| PendingOutboundPayment::AwaitingSelfClaim { .. } => true,
 			_ => false,
 		}
 	}
@@ -285,6 +296,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::Retryable { total_msat, .. } => Some(*total_msat),
 			PendingOutboundPayment::Fulfilled { total_msat, .. } => *total_msat,
 			PendingOutboundPayment::Abandoned { total_msat, .. } => *total_msat,
+			PendingOutboundPayment::AwaitingSelfClaim { amount_msat, .. } => Some(*amount_msat),
 			_ => None,
 		}
 	}
@@ -300,6 +312,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::Retryable { payment_hash, .. } => Some(*payment_hash),
 			PendingOutboundPayment::Fulfilled { payment_hash, .. } => *payment_hash,
 			PendingOutboundPayment::Abandoned { payment_hash, .. } => Some(*payment_hash),
+			PendingOutboundPayment::AwaitingSelfClaim { payment_hash, .. } => Some(*payment_hash),
 		}
 	}
 
@@ -314,6 +327,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::AwaitingOffer { .. } |
 				PendingOutboundPayment::AwaitingInvoice { .. } |
 				PendingOutboundPayment::InvoiceReceived { .. } |
+				PendingOutboundPayment::AwaitingSelfClaim { .. } |
 				PendingOutboundPayment::StaticInvoiceReceived { .. } => { debug_assert!(false); return; },
 		});
 		let payment_hash = self.payment_hash();
@@ -364,6 +378,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::AwaitingOffer { .. } |
 				PendingOutboundPayment::AwaitingInvoice { .. } |
 				PendingOutboundPayment::InvoiceReceived { .. } |
+				PendingOutboundPayment::AwaitingSelfClaim { .. } |
 				PendingOutboundPayment::StaticInvoiceReceived { .. } => { debug_assert!(false); false },
 		};
 		if remove_res {
@@ -396,6 +411,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::AwaitingOffer { .. } |
 				PendingOutboundPayment::AwaitingInvoice { .. } |
 				PendingOutboundPayment::InvoiceReceived { .. } |
+				PendingOutboundPayment::AwaitingSelfClaim { .. } |
 				PendingOutboundPayment::StaticInvoiceReceived { .. } => { debug_assert!(false); false },
 			PendingOutboundPayment::Fulfilled { .. } => false,
 			PendingOutboundPayment::Abandoned { .. } => false,
@@ -432,6 +448,7 @@ impl PendingOutboundPayment {
 			PendingOutboundPayment::AwaitingOffer { .. } => 0,
 			PendingOutboundPayment::InvoiceReceived { .. } => 0,
 			PendingOutboundPayment::StaticInvoiceReceived { .. } => 0,
+			PendingOutboundPayment::AwaitingSelfClaim { .. } => 0,
 		}
 	}
 }
@@ -1726,10 +1743,20 @@ impl OutboundPayments {
 		IH: Fn() -> InFlightHtlcs,
 		SP: Fn(SendAlongPathArgs) -> Result<(), APIError>,
 	{
-		let route = self.find_initial_route(
+		let route = match self.find_initial_route(
 			payment_id, payment_hash, &recipient_onion, keysend_preimage, None, &mut route_params, router,
 			&first_hops, &inflight_htlcs, node_signer, best_block_height, logger,
-		)?;
+		) {
+			Ok(route) => route,
+			// The router found no route. If we're paying our own node id, shortcut to a self-payment
+			// (surfacing `PaymentClaimable`) rather than failing. Any real route, including one that
+			// loops back to us, is sent as a normal HTLC above.
+			Err(RetryableSendFailure::RouteNotFound) => {
+				return self.send_self_payment(payment_id, payment_hash, &route_params, &recipient_onion,
+					node_signer, best_block_height, pending_events);
+			},
+			Err(e) => return Err(e),
+		};
 
 		let onion_session_privs = self.add_new_pending_payment(payment_hash,
 			recipient_onion.clone(), payment_id, keysend_preimage, &route, Some(retry_strategy),
@@ -1753,6 +1780,94 @@ impl OutboundPayments {
 			);
 		}
 		Ok(())
+	}
+
+	/// Shortcuts a payment whose payee is our own node id and for which the router found no route:
+	/// registers a [`PendingOutboundPayment::AwaitingSelfClaim`] and surfaces `PaymentClaimable`
+	/// with no preimage, to be resolved on claim via [`Self::remove_self_payment`]. Returns
+	/// [`RetryableSendFailure::RouteNotFound`] if the payee is not us or no payment secret is set.
+	fn send_self_payment<NS: NodeSigner>(
+		&self, payment_id: PaymentId, payment_hash: PaymentHash, route_params: &RouteParameters,
+		recipient_onion: &RecipientOnionFields, node_signer: &NS, best_block_height: u32,
+		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
+	) -> Result<(), RetryableSendFailure> {
+		let our_node_id = node_signer
+			.get_node_id(Recipient::Node)
+			.map_err(|_| RetryableSendFailure::RouteNotFound)?;
+		let is_self = matches!(
+			&route_params.payment_params.payee,
+			Payee::Clear { node_id, .. } if *node_id == our_node_id
+		);
+		let payment_secret = match recipient_onion.payment_secret {
+			Some(payment_secret) if is_self => payment_secret,
+			_ => return Err(RetryableSendFailure::RouteNotFound),
+		};
+		let amount_msat = route_params.final_value_msat;
+
+		match self.pending_outbound_payments.lock().unwrap().entry(payment_id) {
+			hash_map::Entry::Occupied(_) => return Err(RetryableSendFailure::DuplicatePayment),
+			hash_map::Entry::Vacant(entry) => {
+				entry.insert(PendingOutboundPayment::AwaitingSelfClaim {
+					payment_hash,
+					payment_secret,
+					amount_msat,
+				});
+			},
+		}
+
+		pending_events.lock().unwrap().push_back((
+			events::Event::PaymentClaimable {
+				receiver_node_id: Some(our_node_id),
+				payment_hash,
+				onion_fields: Some(recipient_onion.clone()),
+				amount_msat,
+				counterparty_skimmed_fee_msat: 0,
+				purpose: events::PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage: None,
+					payment_secret,
+				},
+				receiving_channel_ids: Vec::new(),
+				claim_deadline: best_block_height.saturating_add(1008),
+				payment_id: Some(payment_id),
+			},
+			None,
+		));
+		Ok(())
+	}
+
+	/// Marks the [`PendingOutboundPayment::AwaitingSelfClaim`] with the given `payment_hash`
+	/// `Fulfilled`, returning its `(payment_id, payment_secret, amount_msat)` so the claim can
+	/// surface `PaymentSent` and `PaymentClaimed`, or `None` if no such self-payment is tracked.
+	/// The payment is kept (like any other completed payment) so it still appears in
+	/// `list_recent_payments` until it is cleaned up by [`Self::remove_stale_payments`]. This also
+	/// makes a repeated claim a no-op (the entry is no longer `AwaitingSelfClaim`).
+	pub(super) fn fulfill_self_payment(
+		&self, payment_hash: PaymentHash,
+	) -> Option<(PaymentId, PaymentSecret, u64)> {
+		let mut outbounds = self.pending_outbound_payments.lock().unwrap();
+		let payment_id = outbounds.iter().find_map(|(payment_id, payment)| match payment {
+			PendingOutboundPayment::AwaitingSelfClaim { payment_hash: hash, .. }
+				if *hash == payment_hash =>
+			{
+				Some(*payment_id)
+			},
+			_ => None,
+		})?;
+		let payment = outbounds.get_mut(&payment_id)?;
+		let (payment_secret, amount_msat) = match payment {
+			PendingOutboundPayment::AwaitingSelfClaim { payment_secret, amount_msat, .. } => {
+				(*payment_secret, *amount_msat)
+			},
+			_ => return None,
+		};
+		*payment = PendingOutboundPayment::Fulfilled {
+			session_privs: new_hash_set(),
+			payment_hash: Some(payment_hash),
+			timer_ticks_without_htlcs: 0,
+			total_msat: Some(amount_msat),
+			fee_paid_msat: Some(0),
+		};
+		Some((payment_id, payment_secret, amount_msat))
 	}
 
 	#[rustfmt::skip]
@@ -1872,6 +1987,11 @@ impl OutboundPayments {
 						},
 						PendingOutboundPayment::StaticInvoiceReceived { .. } => {
 							log_error!(logger, "Payment already initiating");
+							debug_assert!(false);
+							return
+						},
+						PendingOutboundPayment::AwaitingSelfClaim { .. } => {
+							log_error!(logger, "Self-payment is not retryable");
 							debug_assert!(false);
 							return
 						},
@@ -2832,7 +2952,8 @@ impl OutboundPayments {
 					PendingOutboundPayment::Legacy { .. }
 					| PendingOutboundPayment::Retryable { .. }
 					| PendingOutboundPayment::Fulfilled { .. }
-					| PendingOutboundPayment::Abandoned { .. } => {
+					| PendingOutboundPayment::Abandoned { .. }
+					| PendingOutboundPayment::AwaitingSelfClaim { .. } => {
 						entry.get_mut().insert(session_priv_bytes, &path)
 					},
 				};
@@ -2985,6 +3106,11 @@ impl_writeable_tlv_based_enum_upgradable!(PendingOutboundPayment,
 		))),
 		(6, amount_msats, required),
 		(7, payer_note, option),
+	},
+	(13, AwaitingSelfClaim) => {
+		(0, payment_hash, required),
+		(2, payment_secret, required),
+		(4, amount_msat, required),
 	},
 );
 

@@ -1,0 +1,16 @@
+## API Updates
+
+ * Paying a BOLT11 invoice (via `ChannelManager::pay_for_bolt11_invoice`) or sending a payment
+   (via `ChannelManager::send_payment`) whose payee is our own node is now supported (#2462). When
+   the router finds no route to ourselves, the payment is completed locally rather than over an
+   HTLC: it surfaces `Event::PaymentClaimable` immediately with no preimage (as for a hold
+   invoice) and registers a tracked outbound payment. Providing the preimage via
+   `ChannelManager::claim_funds` then generates `Event::PaymentSent` and `Event::PaymentClaimed`.
+   If the router does find a route back to ourselves, that route is paid as a normal HTLC.
+
+## Backwards Compatibility
+
+ * An unclaimed self-payment is tracked as a new `PendingOutboundPayment` variant, so it is
+   persisted across restarts and appears in `ChannelManager::list_recent_payments`. Downgrading to
+   an LDK version without self-payment support drops any not-yet-claimed self-payment, which is
+   safe as no HTLCs are in-flight for it (#2462).
