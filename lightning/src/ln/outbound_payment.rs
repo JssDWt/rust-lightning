@@ -1327,7 +1327,15 @@ impl OutboundPayments {
 			Err(e) => {
 				let reason = match e {
 					RetryableSendFailure::PaymentExpired => PaymentFailureReason::PaymentExpired,
-					RetryableSendFailure::RouteNotFound => PaymentFailureReason::RouteNotFound,
+					RetryableSendFailure::RouteNotFound => {
+						log_error!(
+							logger,
+							"Failed to find route for payment with id {} and hash {}",
+							payment_id,
+							payment_hash
+						);
+						PaymentFailureReason::RouteNotFound
+					},
 					RetryableSendFailure::DuplicatePayment => PaymentFailureReason::UnexpectedError,
 					RetryableSendFailure::OnionPacketSizeExceeded => PaymentFailureReason::UnexpectedError,
 				};
@@ -1709,15 +1717,14 @@ impl OutboundPayments {
 				RetryableSendFailure::OnionPacketSizeExceeded
 			})?;
 
+		// A `RouteNotFound` is reported by the callers, which know whether it is a
+		// failure: paying our own node id has no route by construction and is turned
+		// into a self-payment rather than an error.
 		let mut route = router.find_route_with_id(
 			&node_signer.get_node_id(Recipient::Node).unwrap(), route_params,
 			Some(&first_hops.iter().collect::<Vec<_>>()), inflight_htlcs(),
 			payment_hash, payment_id,
-		).map_err(|_| {
-			log_error!(logger, "Failed to find route for payment with id {} and hash {}",
-				payment_id, payment_hash);
-			RetryableSendFailure::RouteNotFound
-		})?;
+		).map_err(|_| RetryableSendFailure::RouteNotFound)?;
 
 		validate_found_route(&mut route, route_params, logger)
 			.map_err(|()| RetryableSendFailure::RouteNotFound)?;
@@ -1752,8 +1759,13 @@ impl OutboundPayments {
 			// (surfacing `PaymentClaimable`) rather than failing. Any real route, including one that
 			// loops back to us, is sent as a normal HTLC above.
 			Err(RetryableSendFailure::RouteNotFound) => {
-				return self.send_self_payment(payment_id, payment_hash, &route_params, &recipient_onion,
-					node_signer, best_block_height, pending_events);
+				let res = self.send_self_payment(payment_id, payment_hash, &route_params,
+					&recipient_onion, node_signer, best_block_height, pending_events);
+				if let Err(RetryableSendFailure::RouteNotFound) = res {
+					log_error!(logger, "Failed to find route for payment with id {} and hash {}",
+						payment_id, payment_hash);
+				}
+				return res;
 			},
 			Err(e) => return Err(e),
 		};
